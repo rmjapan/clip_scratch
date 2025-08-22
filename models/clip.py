@@ -1,6 +1,83 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from tokenizer import CLIPTokenizer
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from modules.attention_modules import CustomMultiHeadAttention
+
+
+class CustomTransformerEncoderLayer(nn.Module):
+    """
+    学習用のTransformerEncoderLayer実装
+    
+    構成要素:
+    1. Multi-Head Self-Attention: 入力シーケンス内の各要素間の関係を学習
+    2. Position-wise Feed-Forward Network: 各位置で独立に適用される2層MLP
+    3. Residual Connection: 各サブレイヤーの前後で残差接続
+    4. Layer Normalization: 各サブレイヤー後に正規化
+    
+    処理の流れ:
+    input → Self-Attention → Add & Norm → FFN → Add & Norm → output
+    """
+    
+    def __init__(self, embed_dim, num_heads, dropout=0.1):
+        super().__init__()
+        
+        # Step 1: Multi-Head Self-Attention層
+        # 複数のattention headで異なる種類の関係性を並行学習(詳しくはAliciaYoutubeの動画参照)
+        # 自作Multi-Head Self-Attention (学習用)
+        self.self_attn = CustomMultiHeadAttention(embed_dim, num_heads, dropout)
+        
+        # Step 2: Position-wise Feed-Forward Network
+        # 各位置で独立に適用される2層MLP (embed_dim → ffn_dim → embed_dim)
+        ffn_dim = embed_dim * 4  # CLIPでは通常4倍
+        self.ffn = nn.Sequential(
+            nn.Linear(embed_dim, ffn_dim),
+            nn.GELU(),  # CLIPではGELU活性化関数
+            nn.Dropout(dropout),
+            nn.Linear(ffn_dim, embed_dim),
+            nn.Dropout(dropout)
+        )
+        
+        # Step 3: Layer Normalization層
+        # 各サブレイヤー後に適用する正規化
+        self.norm1 = nn.LayerNorm(embed_dim)  # Self-Attention後
+        self.norm2 = nn.LayerNorm(embed_dim)  # FFN後
+        
+        # Step 4: Dropout (regularization)
+        self.dropout = nn.Dropout(dropout)
+        
+    def forward(self, x, src_key_padding_mask=None):
+        """
+        Forward pass: Transformer Encoder Layerの順伝播
+        
+        Args:
+            x: 入力テンソル [batch_size, seq_len, embed_dim]
+            src_key_padding_mask: attention mask [batch_size, seq_len]
+                                 True positions are ignored in attention
+        
+        Returns:
+            output: 変換された特徴量 [batch_size, seq_len, embed_dim]
+        """
+        
+        # Step 1: Multi-Head Self-Attention + Residual Connection + Layer Norm
+        # Query, Key, Valueは全て同じ入力xから生成 (Self-Attention)
+        attn_output, _ = self.self_attn(
+            query=x, key=x, value=x,
+            key_padding_mask=src_key_padding_mask#tokenidが0の位置をマスク(未知語あるいは、ゼロパディングトークンがこれに該当)
+        )
+        x = self.norm1(x + self.dropout(attn_output))  # Residual + LayerNorm（残差接続と学習効率化のための正規化）
+        
+        # Step 2: Position-wise FFN + Residual Connection + Layer Norm  
+        # 各位置で独立にFFNを適用(2層mlp)
+        ffn_output = self.ffn(x)
+        x = self.norm2(x + ffn_output)  # Residual + LayerNorm
+        
+        return x
+
+
 
 class TextEncoder(nn.Module):
     """
@@ -17,28 +94,24 @@ class TextEncoder(nn.Module):
         super().__init__()
         
         # Step 1: Token embedding layer
-        # 各トークンIDを埋め込みベクトルに変換
-        # self.token_embedding = nn.Embedding(vocab_size, embed_dim)
+        # 各トークンIDを埋め込みベクトルに変換(NN.Embeddingはidとベクトルの対応を表すLookupテーブル、ベクトルは学習可能)
+        self.token_embedding = nn.Embedding(vocab_size, embed_dim)
         
         # Step 2: Positional encoding (学習可能パラメータ)
-        # 各位置の情報をベクトルで表現
-        # self.positional_embedding = nn.Parameter(torch.randn(max_seq_len, embed_dim))
+        # 各位置の情報をベクトルで表現（位置埋め込みで、トークンの順序を考慮）
+        self.positional_embedding = nn.Parameter(torch.randn(max_seq_len, embed_dim))
         
         # Step 3: Transformer encoder layers
         # Multi-head self-attentionで文脈関係を学習
-        # encoder_layer = nn.TransformerEncoderLayer(
-        #     d_model=embed_dim,
-        #     nhead=num_heads,
-        #     dim_feedforward=embed_dim * 4,  # FFN dimension (CLIPでは4倍)
-        #     dropout=0.1,
-        #     activation='gelu',  # CLIPではGELU活性化関数を使用
-        #     batch_first=True   # [batch_size, seq_len, embed_dim] format
-        # )
-        # self.transformer = nn.TransformerEncoder(encoder_layer, num_layers)
+        # 自作TransformerEncoderLayer (学習用)
+        self.transformer = nn.ModuleList([
+            CustomTransformerEncoderLayer(embed_dim, num_heads, dropout=0.1) 
+            for _ in range(num_layers)
+        ])
         
         # Step 4: Final layer normalization
         # 最終出力の正規化
-        # self.ln_final = nn.LayerNorm(embed_dim)
+        self.ln_final = nn.LayerNorm(embed_dim)
         
         # Mask for attention (padding tokens)
         self.max_seq_len = max_seq_len
@@ -58,33 +131,38 @@ class TextEncoder(nn.Module):
             text_features: [batch_size, embed_dim] - 文章レベルの特徴量
         """
         
-       
+        # Step 1: Token embeddingを取得
+        # 各トークンIDを密なベクトル表現に変換
+        x = self.token_embedding(text_tokens)  # [batch_size, seq_len, embed_dim]
+        print(f"{'Token embeddings shape':<30}:{x.shape}")#IDをベクトルに変換
         
         # Step 2: Positional encodingを追加
         # 各位置の情報をembeddingに加算
-        # seq_len = x.shape[1]
-        # x = x + self.positional_embedding[:seq_len].unsqueeze(0)  # broadcast
+        seq_len = x.shape[1]
+        x = x + self.positional_embedding[:seq_len].unsqueeze(0)  # broadcast（[1, seq_len, embed_dim]になる)
         
         # Step 3: Attention maskを作成
         # padding token (0) の位置をマスク
-        # attention_mask = (text_tokens == 0)  # True for padding positions
+        attention_mask = (text_tokens == 0)  # True for padding positions
+        print(f"{'Attention mask':<30}:{attention_mask}")#Attention maskの形状
         
         # Step 4: Transformer encoderに通す
-        # Self-attention + Position-wise FFN # Step 1: Token embeddingを取得
-        # 各トークンIDを密なベクトル表現に変換
-        # x = self.token_embedding(text_tokens)  # [batch_size, seq_len, embed_dim]
-        # x = self.transformer(x, src_key_padding_mask=attention_mask)
+        # 各層を順番に適用
+        for layer in self.transformer:
+            x = layer(x, src_key_padding_mask=attention_mask)
         
         # Step 5: EOT (End of Text) トークンの位置で文章表現を抽出
         # CLIPでは最後の有効トークン位置の特徴量を使用
-        # eot_token_pos = text_tokens.argmax(dim=-1)  # 各文のEOTトークン位置
-        # text_features = x[torch.arange(x.shape[0]), eot_token_pos]
+        print(f"{'text_tokens':<30}:{text_tokens}")#トークンの形状
+        eot_token_pos = text_tokens.argmax(dim=-1)  # 各文のEOTトークン位置(Eotトークンは最大値IDであるため、argmaxで取得)
+        print(f"{'EOT token positions':<30}:{eot_token_pos}")#
+        text_features = x[torch.arange(x.shape[0]), eot_token_pos]
         
         # Step 6: Final layer normalization
-        # text_features = self.ln_final(text_features)
+        text_features = self.ln_final(text_features)
         
-        # return text_features
-        pass
+        return text_features
+        # pass
 
 
 class CLIP(nn.Module):
@@ -101,16 +179,20 @@ class CLIP(nn.Module):
     def __init__(self, vocab_size=50000, embed_dim=512, temperature=0.07, 
                  text_num_heads=8, text_num_layers=12, max_seq_len=77):
         super().__init__()
+        #デバック用
+        self.text_encode_vervose = True
+        self.image_encode_vervose = True
+        
         
         # Step 1: Text Encoderを初期化
         # Transformerベースのテキストエンコーダー
-        # self.text_encoder = TextEncoder(
-        #     vocab_size=vocab_size,
-        #     embed_dim=embed_dim, 
-        #     num_heads=text_num_heads,
-        #     num_layers=text_num_layers,
-        #     max_seq_len=max_seq_len
-        # )
+        self.text_encoder = TextEncoder(
+            vocab_size=vocab_size,
+            embed_dim=embed_dim, 
+            num_heads=text_num_heads,
+            num_layers=text_num_layers,
+            max_seq_len=max_seq_len
+        )
         
         # Step 2: Image Encoderを初期化  
         # Vision Transformerまたは ResNetベースのエンコーダー
@@ -132,14 +214,17 @@ class CLIP(nn.Module):
         テキストをエンコードして埋め込みベクトルを取得
         
         Args:
-            text: トークン化されたテキスト [batch_size, seq_len]
+            text: 通常のテキスト
             
         Returns:
             text_features: 正規化された埋め込みベクトル [batch_size, embed_dim]
         """
+        #Step 0: トークン化処理
+        text = CLIPTokenizer().encode(text)# トークン化処理
+        print(f"{'tokenized textの形状データ':<30}:{text.shape}")
         # Step 1: テキストエンコーダーでテキスト特徴量を抽出
         # Transformerを通して文脈を考慮した文章表現を取得
-        # text_features = self.text_encoder(text)  # [batch_size, embed_dim]
+        text_features = self.text_encoder(text)  # [batch_size, embed_dim]
         
         # Step 2: プロジェクション層で最終埋め込み次元にマッピング
         # テキストエンコーダーの出力をCLIP空間に投影
@@ -250,3 +335,8 @@ def contrastive_loss(logits_per_image, logits_per_text):
     
     # return loss
     pass
+
+if __name__ == "__main__":
+    text=["a photo of a cat", "a photo of a dog with a ball"]
+    model = CLIP()
+    model.encode_text(text)
