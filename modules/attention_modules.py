@@ -144,4 +144,72 @@ class CustomMultiHeadAttention(nn.Module):
         
         return output, attention_weights
 
+
+class CustomTransformerEncoderLayer(nn.Module):
+    """
+    学習用のTransformerEncoderLayer実装
     
+    構成要素:
+    1. Multi-Head Self-Attention: 入力シーケンス内の各要素間の関係を学習
+    2. Position-wise Feed-Forward Network: 各位置で独立に適用される2層MLP
+    3. Residual Connection: 各サブレイヤーの前後で残差接続
+    4. Layer Normalization: 各サブレイヤー後に正規化
+    
+    処理の流れ:
+    input → Self-Attention → Add & Norm → FFN → Add & Norm → output
+    """
+    
+    def __init__(self, embed_dim, num_heads, dropout=0.1):
+        super().__init__()
+        
+        # Step 1: Multi-Head Self-Attention層
+        # 複数のattention headで異なる種類の関係性を並行学習(詳しくはAliciaYoutubeの動画参照)
+        # 自作Multi-Head Self-Attention (学習用)
+        self.self_attn = CustomMultiHeadAttention(embed_dim, num_heads, dropout)
+        
+        # Step 2: Position-wise Feed-Forward Network
+        # 各位置で独立に適用される2層MLP (embed_dim → ffn_dim → embed_dim)
+        ffn_dim = embed_dim * 4  # CLIPでは通常4倍
+        self.ffn = nn.Sequential(
+            nn.Linear(embed_dim, ffn_dim),
+            nn.GELU(),  # CLIPではGELU活性化関数
+            nn.Dropout(dropout),
+            nn.Linear(ffn_dim, embed_dim),
+            nn.Dropout(dropout)
+        )
+        
+        # Step 3: Layer Normalization層
+        # 各サブレイヤー後に適用する正規化
+        self.norm1 = nn.LayerNorm(embed_dim)  # Self-Attention後
+        self.norm2 = nn.LayerNorm(embed_dim)  # FFN後
+        
+        # Step 4: Dropout (regularization)
+        self.dropout = nn.Dropout(dropout)
+        
+    def forward(self, x, src_key_padding_mask=None):
+        """
+        Forward pass: Transformer Encoder Layerの順伝播
+        
+        Args:
+            x: 入力テンソル [batch_size, seq_len, embed_dim]
+            src_key_padding_mask: attention mask [batch_size, seq_len]
+                                 True positions are ignored in attention
+        
+        Returns:
+            output: 変換された特徴量 [batch_size, seq_len, embed_dim]
+        """
+        
+        # Step 1: Multi-Head Self-Attention + Residual Connection + Layer Norm
+        # Query, Key, Valueは全て同じ入力xから生成 (Self-Attention)
+        attn_output, _ = self.self_attn(
+            query=x, key=x, value=x,
+            key_padding_mask=src_key_padding_mask#tokenidが0の位置をマスク(未知語あるいは、ゼロパディングトークンがこれに該当)
+        )
+        x = self.norm1(x + self.dropout(attn_output))  # Residual + LayerNorm（残差接続と学習効率化のための正規化）
+        
+        # Step 2: Position-wise FFN + Residual Connection + Layer Norm  
+        # 各位置で独立にFFNを適用(2層mlp)
+        ffn_output = self.ffn(x)
+        x = self.norm2(x + ffn_output)  # Residual + LayerNorm
+        
+        return x
